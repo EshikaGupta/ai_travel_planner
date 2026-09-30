@@ -1,5 +1,3 @@
-# pip install mcp requests
-
 from mcp.server.fastmcp import FastMCP
 import requests
 import os
@@ -12,21 +10,27 @@ mcp = FastMCP("Weather Server")
 
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
 
+
+def _get(url, params):
+    if not OPENWEATHER_API_KEY:
+        return {"error": "OPENWEATHER_API_KEY is not configured."}
+    try:
+        response = requests.get(url, params=params, timeout=15)
+        data = response.json()
+        if response.status_code != 200:
+            return {"error": data.get("message", "Weather API request failed."), "status": response.status_code}
+        return data
+    except requests.RequestException as exc:
+        return {"error": f"Weather API request failed: {exc}"}
+
+
 @mcp.tool()
 def get_current_weather(city: str):
-
-    response = requests.get(
+    data = _get(
         "https://api.openweathermap.org/data/2.5/weather",
-        params={
-            "q": city,
-            "appid": OPENWEATHER_API_KEY,
-            "units": "metric"
-        }
+        {"q": city, "appid": OPENWEATHER_API_KEY, "units": "metric"},
     )
-
-    data = response.json()
-
-    if response.status_code != 200:
+    if "error" in data:
         return data
 
     return {
@@ -35,50 +39,30 @@ def get_current_weather(city: str):
         "feels_like_c": data["main"]["feels_like"],
         "humidity": data["main"]["humidity"],
         "condition": data["weather"][0]["description"],
-        "wind_speed": data["wind"]["speed"]
+        "wind_speed": data["wind"]["speed"],
     }
 
 
 
 @mcp.tool()
 def get_forecast(city: str):
-
-    url = (
-        "https://api.openweathermap.org/data/2.5/forecast"
+    data = _get(
+        "https://api.openweathermap.org/data/2.5/forecast",
+        {"q": city, "appid": OPENWEATHER_API_KEY, "units": "metric"},
     )
+    if "error" in data:
+        return data
 
-    params = {
-        "q": city,
-        "appid": OPENWEATHER_API_KEY,
-        "units": "metric"
-    }
+    forecast = [
+        {
+            "datetime": item["dt_txt"],
+            "temperature": item["main"]["temp"],
+            "weather": item["weather"][0]["description"],
+        }
+        for item in data.get("list", [])[:5]
+    ]
 
-    response = requests.get(
-        url,
-        params=params
-    )
-
-    data = response.json()
-
-    forecast = []
-
-    # Return first 5 forecast entries
-    for item in data["list"][:5]:
-
-        forecast.append(
-            {
-                "datetime": item["dt_txt"],
-                "temperature": item["main"]["temp"],
-                "weather": item["weather"][0]["description"]
-            }
-        )
-
-    return {
-        "city": city,
-        "forecast": forecast
-    }
-
-
+    return {"city": city, "forecast": forecast}
 
 
 if __name__ == "__main__":
