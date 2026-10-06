@@ -12,6 +12,14 @@ AVIATIONSTACK_API_KEY = os.getenv("AVIATIONSTACK_API_KEY")
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+_ACTIVE_PROVIDER = None
+
+def set_provider(provider: str):
+    global _ACTIVE_PROVIDER
+    _ACTIVE_PROVIDER = provider
+
+def get_active_provider():
+    return _ACTIVE_PROVIDER or os.getenv("LLM_PROVIDER")
 
 def get_llm(provider):
     """Create the configured chat model.
@@ -49,7 +57,7 @@ def get_llm(provider):
         if not key:
             raise RuntimeError("GROQ_API_KEY is not set.")
         return ChatGroq(
-            model=os.getenv("GROQ_MODEL") or "openai/gpt-oss-120b",
+            model=os.getenv("GROQ_MODEL") or "openai/gpt-oss-20b",
             groq_api_key=key,
             temperature=temperature,
         )

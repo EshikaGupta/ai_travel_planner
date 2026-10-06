@@ -1,4 +1,3 @@
-import asyncio
 import os
 import sys
 from datetime import datetime, timezone
@@ -9,179 +8,275 @@ from langchain_mcp_adapters.client import MultiServerMCPClient
 from pydantic import BaseModel
 
 from config import (
-    AVIATIONSTACK_API_KEY,
     OPENWEATHER_API_KEY,
     TAVILY_API_KEY,
 )
 
 load_dotenv()
 
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
-def _python_executable():
-    return os.getenv("PYTHON_EXECUTABLE", sys.executable)
+GOOGLE_FLIGHTS_MCP_ROOT = os.path.join(
+    PROJECT_ROOT,
+    "google-flights-mcp",
+)
 
+GOOGLE_FLIGHTS_PYTHON = os.path.join(
+    GOOGLE_FLIGHTS_MCP_ROOT,
+    ".venv",
+    "Scripts",
+    "python.exe",
+)
 
-aviation_python = os.getenv("AVIATIONSTACK_MCP_PYTHON", _python_executable())
-aviation_module = os.getenv("AVIATIONSTACK_MCP_MODULE", "aviationstack_mcp")
-weather_script = os.path.join(os.path.dirname(__file__), "custom_meather_mcp_server.py")
-
-
-client = MultiServerMCPClient(
-    {
-        "tavily": {
-            "transport": "streamable_http",
-            "url": f"https://mcp.tavily.com/mcp/?tavilyApiKey={TAVILY_API_KEY}",
-        },
-        "aviationstack": {
-            "transport": "stdio",
-            "command": aviation_python,
-            "args": ["-m", aviation_module, "mcp", "run"],
-            "env": {"AVIATIONSTACK_API_KEY": AVIATIONSTACK_API_KEY or ""},
-        },
-        "weather": {
-            "transport": "stdio",
-            "command": _python_executable(),
-            "args": [weather_script],
-            "env": {"OPENWEATHER_API_KEY": OPENWEATHER_API_KEY or ""},
-        },
-    }
+GOOGLE_FLIGHTS_SERVER = os.path.join(
+    GOOGLE_FLIGHTS_MCP_ROOT,
+    "src",
+    "mcp_server_google_flights",
+    "server.py",
 )
 
 
 class ToolResult(BaseModel):
-    """Normalized, typed envelope returned by every MCP tool."""
-
-    status: Literal["ok", "no_data", "error"]
+    status: Literal["ok", "error", "no_data"]
     data: Any = None
     source: str
     timestamp: str
-    error: str = ""
+    error: str | None = None
 
 
-_tools_cache = None
+def _python_executable():
+    return os.getenv("PYTHON_EXECUTABLE", sys.executable)
 
 
 def _timestamp() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _normalize_result(raw: Any, source: str) -> ToolResult:
-    if isinstance(raw, ToolResult):
-        return raw
+weather_script = os.path.join(
+    os.path.dirname(__file__),
+    "custom_meather_mcp_server.py",
+)
 
-    if isinstance(raw, dict) and raw.get("error"):
-        return ToolResult(
-            status="error",
-            data=None,
-            source=source,
-            timestamp=_timestamp(),
-            error=str(raw.get("error")),
+
+SERVER_CONFIG = {
+    "tavily": {
+        "transport": "streamable_http",
+        "url": f"https://mcp.tavily.com/mcp/?tavilyApiKey={TAVILY_API_KEY}",
+    },
+    "google_flights": {
+        "transport": "stdio",
+        "command": GOOGLE_FLIGHTS_PYTHON,
+        "args": [GOOGLE_FLIGHTS_SERVER],
+        "env": {},
+    },
+    "weather": {
+        "transport": "stdio",
+        "command": _python_executable(),
+        "args": [weather_script],
+        "env": {
+            "OPENWEATHER_API_KEY": OPENWEATHER_API_KEY or "",
+        },
+    },
+}
+
+
+def _exception_text(exc: BaseException) -> str:
+    """Keep useful details when an MCP library wraps an error in ExceptionGroup."""
+    if isinstance(exc, BaseExceptionGroup):
+        details = []
+        for child in exc.exceptions:
+            details.append(_exception_text(child))
+        return "; ".join(details) or str(exc)
+
+    return f"{type(exc).__name__}: {exc}"
+
+
+async def _call_server_tool(
+    server_name: str,
+    tool_name: str,
+    args: dict | None = None,
+) -> ToolResult:
+    source = {
+        "tavily": "Tavily Search",
+        "google_flights": "Google Flights",
+        "weather": "OpenWeather",
+    }.get(server_name, server_name)
+
+    try:
+        server_client = MultiServerMCPClient(
+            {server_name: SERVER_CONFIG[server_name]}
         )
 
-    if raw is None or (isinstance(raw, str) and not raw.strip()) or raw == [] or raw == {}:
-        return ToolResult(
-            status="no_data",
-            data=None,
-            source=source,
-            timestamp=_timestamp(),
-            error="Tool returned no data.",
+        tools = await server_client.get_tools()
+
+        tool = next(
+            (item for item in tools if item.name == tool_name),
+            None,
         )
 
-    if isinstance(raw, dict):
-        payload = raw.get("data", raw.get("results"))
-        if payload == [] or (payload is None and "data" in raw):
+        if tool is None:
+            raise ValueError(
+                f"Tool '{tool_name}' not found on MCP server "
+                f"'{server_name}'."
+            )
+
+        raw = await tool.ainvoke(args or {})
+
+        if raw is None or raw == "" or raw == [] or raw == {}:
             return ToolResult(
                 status="no_data",
                 data=None,
                 source=source,
                 timestamp=_timestamp(),
-                error="Tool returned no data.",
             )
 
-    return ToolResult(
-        status="ok",
-        data=raw,
-        source=source,
-        timestamp=_timestamp(),
-    )
+        return ToolResult(
+            status="ok",
+            data=raw,
+            source=source,
+            timestamp=_timestamp(),
+        )
 
-
-async def get_tools():
-    """Load MCP tools without letting one broken server cancel the others."""
-    global _tools_cache
-
-    if _tools_cache is not None:
-        return _tools_cache
-
-    loaded_tools = []
-    errors = []
-
-    for server_name in client.connections:
-        try:
-            loaded_tools.extend(await client.get_tools(server_name=server_name))
-        except Exception as exc:
-            errors.append(f"{server_name}: {type(exc).__name__}: {exc}")
-
-    if not loaded_tools and errors:
-        raise RuntimeError("MCP tool loading failed: " + " | ".join(errors))
-
-    _tools_cache = loaded_tools
-    return _tools_cache
-
-
-async def call_tool(tool_name: str, args: dict | None = None, source: str = "MCP") -> ToolResult:
-    try:
-        tools = await get_tools()
-        tool = next((tool for tool in tools if tool.name == tool_name), None)
-        if tool is None:
-            raise ValueError(f"Tool '{tool_name}' not found")
-        raw = await tool.ainvoke(args or {})
-        return _normalize_result(raw, source)
     except Exception as exc:
         return ToolResult(
             status="error",
-            data=None,
             source=source,
             timestamp=_timestamp(),
-            error=f"{type(exc).__name__}: {exc}",
+            error=_exception_text(exc),
         )
 
 
-async def tavily_search(query: str):
-    return await call_tool(
+async def tavily_search(query: str) -> ToolResult:
+    if not query.strip():
+        return ToolResult(
+            status="error",
+            source="Tavily Search",
+            timestamp=_timestamp(),
+            error="Search query is empty.",
+        )
+
+    if not TAVILY_API_KEY:
+        return ToolResult(
+            status="error",
+            source="Tavily Search",
+            timestamp=_timestamp(),
+            error="TAVILY_API_KEY is not set.",
+        )
+
+    return await _call_server_tool(
+        "tavily",
         "tavily_search",
         {"query": query},
-        source="Tavily Search",
     )
 
 
-async def list_airports(search: str = "", limit: int = 10):
-    return await call_tool(
-        "list_airports",
-        {"search": search, "limit": limit, "offset": 0},
-        source="AviationStack",
+async def search_one_way_flights(
+    origin: str,
+    destination: str,
+    date: str,
+    adults: int = 1,
+    children: int = 0,
+    infants_in_seat: int = 0,
+    infants_on_lap: int = 0,
+    seat_type: str = "economy",
+    return_cheapest_only: bool = False,
+    max_results: int = 10,
+    compact_mode: bool = True,
+) -> ToolResult:
+    return await _call_server_tool(
+        "google_flights",
+        "search_one_way_flights",
+        {
+            "origin": origin,
+            "destination": destination,
+            "date": date,
+            "adults": adults,
+            "children": children,
+            "infants_in_seat": infants_in_seat,
+            "infants_on_lap": infants_on_lap,
+            "seat_type": seat_type,
+            "return_cheapest_only": return_cheapest_only,
+            "max_results": max_results,
+            "compact_mode": compact_mode,
+        },
     )
 
 
-async def list_airlines(search: str = "", limit: int = 10):
-    return await call_tool(
-        "list_airlines",
-        {"search": search, "limit": limit, "offset": 0},
-        source="AviationStack",
+async def search_round_trip_flights(
+    origin: str,
+    destination: str,
+    departure_date: str,
+    return_date: str,
+    adults: int = 1,
+    children: int = 0,
+    infants_in_seat: int = 0,
+    infants_on_lap: int = 0,
+    seat_type: str = "economy",
+    max_stops: int = 2,
+    return_cheapest_only: bool = False,
+    max_results: int = 10,
+    compact_mode: bool = True,
+) -> ToolResult:
+    return await _call_server_tool(
+        "google_flights",
+        "search_round_trip_flights",
+        {
+            "origin": origin,
+            "destination": destination,
+            "departure_date": departure_date,
+            "return_date": return_date,
+            "adults": adults,
+            "children": children,
+            "infants_in_seat": infants_in_seat,
+            "infants_on_lap": infants_on_lap,
+            "seat_type": seat_type,
+            "max_stops": max_stops,
+            "return_cheapest_only": return_cheapest_only,
+            "max_results": max_results,
+            "compact_mode": compact_mode,
+        },
     )
 
 
-async def current_weather(city: str):
-    return await call_tool(
+async def generate_google_flights_url(
+    origin: str,
+    destination: str,
+    departure_date: str,
+    return_date: str | None = None,
+    adults: int = 1,
+    children: int = 0,
+    seat_type: str = "economy",
+) -> ToolResult:
+    args = {
+        "origin": origin,
+        "destination": destination,
+        "departure_date": departure_date,
+        "adults": adults,
+        "children": children,
+        "seat_type": seat_type,
+    }
+
+    if return_date:
+        args["return_date"] = return_date
+
+    return await _call_server_tool(
+        "google_flights",
+        "generate_google_flights_url",
+        args,
+    )
+
+
+async def current_weather(city: str) -> ToolResult:
+    return await _call_server_tool(
+        "weather",
         "get_current_weather",
         {"city": city},
-        source="OpenWeather",
     )
 
 
-async def forecast(city: str):
-    return await call_tool(
+async def forecast(city: str) -> ToolResult:
+    return await _call_server_tool(
+        "weather",
         "get_forecast",
         {"city": city},
-        source="OpenWeather",
     )

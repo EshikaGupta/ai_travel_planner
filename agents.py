@@ -1,5 +1,7 @@
 import asyncio
 import json
+import re
+from datetime import datetime, timedelta
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -7,21 +9,20 @@ from pydantic import BaseModel, Field
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.types import interrupt
 
-from config import get_llm
 from mcp_client import (
     current_weather,
     forecast,
-    list_airlines,
-    list_airports,
+    search_one_way_flights,
+    search_round_trip_flights,
+    generate_google_flights_url,
     tavily_search,
 )
 from state import TravelState
-import streamlit as st
+from airport_resolver import resolve_airports
+from config import get_llm, get_active_provider
 
 def _get_llm():
-    provider = st.session_state.get("llm_provider", "gemini")
-    return get_llm(provider)
-
+    return get_llm(get_active_provider())
 
 # Structured outputs are used only where the graph needs machine-readable data.
 # Normal specialist/final responses remain plain text.
@@ -35,6 +36,8 @@ class TripConstraints(BaseModel):
     origin: str = ""
     duration: str = ""
     budget: str = ""
+    departure_date: str = ""
+    return_date: str = ""
     travel_style: str = ""
     special_preferences: list[str] = Field(default_factory=list)
 
@@ -91,6 +94,73 @@ def _safe_async(coro, default=""):
 # ============================================================
 # LLM HELPERS
 # ============================================================
+
+def _tool_result_text(result: Any) -> str:
+    """Extract displayable text from a structured MCP ToolResult."""
+    if result is None:
+        return ""
+
+    data = getattr(result, "data", result)
+
+    # MCP content blocks, e.g. [{"type": "text", "text": "..."}]
+    if isinstance(data, list):
+        parts = []
+        for item in data:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+            else:
+                parts.append(_content_to_text(item))
+        return "\n\n".join(part for part in parts if part).strip()
+
+    if isinstance(data, dict):
+        if isinstance(data.get("text"), str):
+            return data["text"].strip()
+        return json.dumps(data, ensure_ascii=False, indent=2)
+
+    return _content_to_text(data).strip()
+
+
+def _format_tavily_result(result: Any) -> str:
+    """Turn Tavily's MCP response into readable Markdown."""
+    text = _tool_result_text(result)
+    if not text:
+        return "Hotel search data is currently unavailable."
+
+    try:
+        payload = json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        return text
+
+    if not isinstance(payload, dict):
+        return text
+
+    sections = []
+
+    answer = payload.get("answer")
+    if isinstance(answer, str) and answer.strip():
+        sections.append(answer.strip())
+
+    for item in payload.get("results", []):
+        if not isinstance(item, dict):
+            continue
+
+        title = str(item.get("title", "")).strip()
+        content = str(item.get("content", "")).strip()
+        url = str(item.get("url", "")).strip()
+
+        if not title and not content:
+            continue
+
+        if title and url:
+            sections.append(f"### [{title}]({url})")
+        elif title:
+            sections.append(f"### {title}")
+
+        if content:
+            sections.append(content)
+
+    return "\n\n".join(sections).strip() or "Hotel search data is currently unavailable."
+
 
 def _content_to_text(content: Any) -> str:
     """Normalize LangChain content from Gemini, Groq, OpenAI, etc. to text."""
@@ -288,6 +358,8 @@ def _fallback_supervisor(query: str) -> dict:
             "origin": origin,
             "duration": "",
             "budget": "",
+            "departure_date": "",
+            "return_date": "",
             "travel_style": "",
             "special_preferences": [],
         },
@@ -428,6 +500,18 @@ Examples
 
 Return the structured fields exactly as requested.
 
+IMPORTANT DATE EXTRACTION RULES:
+- Extract trip duration whenever the user gives one, such as "7-day trip",
+  "7 days", "5 nights", etc.
+- If the user gives a departure date and a duration but no explicit return
+  date, DO NOT ask the user for a return date.
+- Preserve the duration in trip_constraints.duration.
+- The flight agent will derive the return date from departure_date + duration.
+- Example: "7-day trip from Delhi on 10 October" means departure_date =
+  2026-10-10 and duration = "7 days". The flight agent should derive the
+  return date as 2026-10-17.
+- If an explicit return date is provided, use that date instead.
+
 User request:
 {query}
 """
@@ -508,38 +592,505 @@ User request:
 async def flight_agent(state: TravelState):
     query = state["user_query"]
     constraints = state["trip_constraints"]
-    destination = constraints.get("destination", "")
+
+    origin_input = constraints.get("origin", "").strip()
+    destination_input = constraints.get("destination", "").strip()
+    departure_date = constraints.get("departure_date", "").strip()
+    return_date = constraints.get("return_date", "").strip()
 
     print("\n========== FLIGHT AGENT INPUT ==========")
     print("Query:", query)
-    print("Constraints:", constraints)
+    print("Origin:", origin_input)
+    print("Destination:", destination_input)
+    print("Departure date:", departure_date)
+    print("Return date:", return_date)
     print("========================================\n")
 
-    try:
-        airports = await list_airports(destination, limit=10)
-    except Exception as exc:
-        print(f"Flight airport lookup failed: {type(exc).__name__}: {exc}")
-        airports = "Airport data unavailable."
+    # ------------------------------------------------------------
+    # Required information
+    # ------------------------------------------------------------
+
+    if not origin_input or not destination_input:
+        result = (
+            "I need both the departure location and destination "
+            "to search for flights."
+        )
+
+        return {
+            "flight_results": result,
+            "messages": [
+                AIMessage(content="Flight search requires origin and destination.")
+            ],
+            "llm_calls": state.get("llm_calls", 0),
+        }
+
+    if not departure_date:
+        result = (
+            "I need a specific departure date to search live flight options. "
+            "Please provide the departure date."
+        )
+
+        return {
+            "flight_results": result,
+            "messages": [
+                AIMessage(content="Flight search requires a departure date.")
+            ],
+            "llm_calls": state.get("llm_calls", 0),
+        }
+
+    # ------------------------------------------------------------
+    # Derive return date from trip duration when the user did not
+    # explicitly provide one.
+    #
+    # Example:
+    #   7-day trip starting 2026-10-10
+    #   -> return date 2026-10-17
+    #
+    # A "7-day trip" is treated as 7 elapsed days from departure.
+    # An explicit return_date always takes precedence.
+    # ------------------------------------------------------------
+
+    if not return_date:
+        duration_text = str(
+            constraints.get("duration", "")
+        ).strip()
+
+        duration_match = re.search(
+            r"(\d+)\s*(?:-\s*)?(?:day|days|night|nights)\b",
+            duration_text.lower(),
+        )
+
+        if duration_match:
+            trip_duration = int(duration_match.group(1))
+
+            try:
+                departure_dt = datetime.strptime(
+                    departure_date,
+                    "%Y-%m-%d",
+                )
+
+                return_dt = departure_dt + timedelta(days=trip_duration)
+                return_date = return_dt.strftime("%Y-%m-%d")
+
+                print(
+                    "Derived return date from duration:",
+                    return_date,
+                )
+
+            except ValueError:
+                print(
+                    "Could not derive return date. Invalid departure date:",
+                    departure_date,
+                )
+
+    # If the supervisor failed to extract duration, try the original
+    # user query as a deterministic backup.
+    if not return_date:
+        duration_match = re.search(
+            r"(\d+)\s*(?:-\s*)?(?:day|days|night|nights)\b",
+            query.lower(),
+        )
+
+        if duration_match:
+            trip_duration = int(duration_match.group(1))
+
+            try:
+                departure_dt = datetime.strptime(
+                    departure_date,
+                    "%Y-%m-%d",
+                )
+
+                return_dt = departure_dt + timedelta(days=trip_duration)
+                return_date = return_dt.strftime("%Y-%m-%d")
+
+                print(
+                    "Derived return date from user query:",
+                    return_date,
+                )
+
+            except ValueError:
+                pass
+
+    # Only ask if neither an explicit return date nor a usable duration
+    # exists. A duration-based trip should NEVER trigger this question.
+    if not return_date:
+        result = (
+            "I have the departure date, but I need either a return date "
+            "or a trip duration to search round-trip flights."
+        )
+
+        return {
+            "flight_results": result,
+            "messages": [
+                AIMessage(content="Return date could not be determined.")
+            ],
+            "llm_calls": state.get("llm_calls", 0),
+        }
+
+    # Keep the derived date in shared state so hotel, budget and itinerary
+    # agents all see the same trip dates.
+    constraints["return_date"] = return_date
+
+    # ------------------------------------------------------------
+    # Resolve city / country / airport -> real IATA codes
+    # ------------------------------------------------------------
 
     try:
-        airlines = await list_airlines("", limit=10)
+        origin_airports = resolve_airports(
+            origin_input,
+            max_results=2,
+        )
+
+        destination_airports = resolve_airports(
+            destination_input,
+            max_results=5,
+        )
+
     except Exception as exc:
-        print(f"Flight airline lookup failed: {type(exc).__name__}: {exc}")
-        airlines = "Airline data unavailable."
+        print(
+            f"Airport resolution failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
 
-    print("\n========== AIRPORT MCP DATA ==========")
-    print(airports)
-    print("======================================\n")
+        result = (
+            "I could not resolve the departure or destination "
+            "to a valid airport. Please provide a city or airport name."
+        )
 
-    print("\n========== AIRLINE MCP DATA ==========")
-    print(airlines)
-    print("======================================\n")
+        return {
+            "flight_results": result,
+            "messages": [
+                AIMessage(content="Airport resolution failed.")
+            ],
+            "llm_calls": state.get("llm_calls", 0),
+        }
+
+    if not origin_airports:
+        result = (
+            f"I couldn't find a suitable airport for '{origin_input}'. "
+            "Please provide a city, airport name, or IATA code."
+        )
+
+        return {
+            "flight_results": result,
+            "messages": [
+                AIMessage(content="Origin airport could not be resolved.")
+            ],
+            "llm_calls": state.get("llm_calls", 0),
+        }
+
+    if not destination_airports:
+        result = (
+            f"I couldn't find a suitable airport for '{destination_input}'. "
+            "Please provide a destination city, airport name, or IATA code."
+        )
+
+        return {
+            "flight_results": result,
+            "messages": [
+                AIMessage(content="Destination airport could not be resolved.")
+            ],
+            "llm_calls": state.get("llm_calls", 0),
+        }
+
+    print("\n========== AIRPORT RESOLUTION ==========")
+    print(
+        "Origin:",
+        [(a.iata, a.name) for a in origin_airports],
+    )
+    print(
+        "Destination:",
+        [(a.iata, a.name) for a in destination_airports],
+    )
+    print("========================================\n")
+
+    # ------------------------------------------------------------
+    # Helper: determine whether the MCP response actually contains
+    # usable flight data. The MCP wrapper can return status="ok"
+    # even when the underlying server returns a JSON error object.
+    # ------------------------------------------------------------
+
+    def _usable_flight_result(raw_result: Any) -> tuple[bool, str]:
+        text = _tool_result_text(raw_result).strip()
+
+        if not text:
+            return False, ""
+
+        if getattr(raw_result, "status", None) == "error":
+            return False, ""
+
+        try:
+            payload = json.loads(text)
+
+            if isinstance(payload, dict):
+                if payload.get("error"):
+                    return False, ""
+
+                # Some successful MCP responses contain a list/count/data
+                # structure. An explicit error is the important failure case.
+                if payload.get("status") == "error":
+                    return False, ""
+
+        except (TypeError, json.JSONDecodeError):
+            # Non-JSON text can still be a valid successful result.
+            pass
+
+        return True, text
+
+    # ------------------------------------------------------------
+    # 1. PRIMARY SEARCH: ROUND TRIP ONLY
+    #
+    # Search round-trip combinations first. We do NOT expose one-way
+    # results if a valid round-trip result is available.
+    # ------------------------------------------------------------
+
+    round_trip_results = []
+
+    max_combinations = 8
+    combinations = [
+        (origin_airport, destination_airport)
+        for origin_airport in origin_airports
+        for destination_airport in destination_airports
+    ][:max_combinations]
+
+    for origin_airport, destination_airport in combinations:
+        origin_code = origin_airport.iata
+        destination_code = destination_airport.iata
+
+        try:
+            print(
+                f"\nSearching ROUND TRIP: "
+                f"{origin_code} -> {destination_code}"
+            )
+
+            raw_result = await search_round_trip_flights(
+                origin=origin_code,
+                destination=destination_code,
+                departure_date=departure_date,
+                return_date=return_date,
+                adults=1,
+                seat_type="economy",
+                max_stops=2,
+                return_cheapest_only=False,
+                max_results=10,
+                compact_mode=True,
+            )
+
+            usable, result_text = _usable_flight_result(raw_result)
+
+            if usable:
+                round_trip_results.append(
+                    f"### Round trip: {origin_code} -> {destination_code}\n"
+                    f"Origin airport: {origin_airport.name}\n"
+                    f"Destination airport: {destination_airport.name}\n"
+                    f"Departure: {departure_date}\n"
+                    f"Return: {return_date}\n"
+                    f"{result_text}"
+                )
+
+                print(
+                    f"Round-trip data available for "
+                    f"{origin_code} -> {destination_code}"
+                )
+            else:
+                print(
+                    f"No usable round-trip data for "
+                    f"{origin_code} -> {destination_code}"
+                )
+
+        except Exception as exc:
+            print(
+                f"Round-trip search failed for "
+                f"{origin_code} -> {destination_code}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+    # ------------------------------------------------------------
+    # 2. FALLBACK: TWO ONE-WAY SEARCHES
+    #
+    # Only run this section if NO usable round-trip result was found.
+    #
+    # Outbound:
+    #   origin -> destination on departure date
+    #
+    # Return:
+    #   destination -> origin on return date
+    #
+    # We keep the two directions separate so the LLM cannot mistake
+    # two unrelated one-way prices for a round-trip fare.
+    # ------------------------------------------------------------
+
+    fallback_one_way_results = []
+
+    if not round_trip_results:
+        print(
+            "\n========== ROUND TRIP UNAVAILABLE =========="
+        )
+        print(
+            "No usable round-trip results. "
+            "Falling back to outbound + return one-way searches."
+        )
+        print("=============================================\n")
+
+        # Keep the fallback bounded. We use the same airport combinations
+        # as the round-trip attempt, but each successful combination requires
+        # two one-way searches.
+        for origin_airport, destination_airport in combinations:
+            origin_code = origin_airport.iata
+            destination_code = destination_airport.iata
+
+            outbound_text = ""
+            return_text = ""
+
+            # -----------------------------
+            # Outbound
+            # -----------------------------
+            try:
+                print(
+                    f"\nSearching ONE WAY OUTBOUND: "
+                    f"{origin_code} -> {destination_code} "
+                    f"on {departure_date}"
+                )
+
+                raw_outbound = await search_one_way_flights(
+                    origin=origin_code,
+                    destination=destination_code,
+                    date=departure_date,
+                    adults=1,
+                    seat_type="economy",
+                    return_cheapest_only=False,
+                    max_results=10,
+                    compact_mode=True,
+                )
+
+                outbound_usable, outbound_text = _usable_flight_result(
+                    raw_outbound
+                )
+
+                if not outbound_usable:
+                    outbound_text = ""
+
+            except Exception as exc:
+                print(
+                    f"Outbound one-way search failed for "
+                    f"{origin_code} -> {destination_code}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+            # -----------------------------
+            # Return
+            # -----------------------------
+            try:
+                print(
+                    f"\nSearching ONE WAY RETURN: "
+                    f"{destination_code} -> {origin_code} "
+                    f"on {return_date}"
+                )
+
+                raw_return = await search_one_way_flights(
+                    origin=destination_code,
+                    destination=origin_code,
+                    date=return_date,
+                    adults=1,
+                    seat_type="economy",
+                    return_cheapest_only=False,
+                    max_results=10,
+                    compact_mode=True,
+                )
+
+                return_usable, return_text = _usable_flight_result(
+                    raw_return
+                )
+
+                if not return_usable:
+                    return_text = ""
+
+            except Exception as exc:
+                print(
+                    f"Return one-way search failed for "
+                    f"{destination_code} -> {origin_code}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+            # Keep only combinations where at least one direction
+            # returned actual usable data.
+            if outbound_text or return_text:
+                fallback_one_way_results.append(
+                    f"### One-way fallback: "
+                    f"{origin_code} <-> {destination_code}\n"
+                    f"Origin airport: {origin_airport.name}\n"
+                    f"Destination airport: {destination_airport.name}\n\n"
+                    f"**Outbound ({departure_date}): "
+                    f"{origin_code} -> {destination_code}**\n"
+                    f"{outbound_text or 'No outbound flight data available.'}\n\n"
+                    f"**Return ({return_date}): "
+                    f"{destination_code} -> {origin_code}**\n"
+                    f"{return_text or 'No return flight data available.'}"
+                )
+
+    # ------------------------------------------------------------
+    # Choose what to send to the LLM.
+    #
+    # Round-trip results ALWAYS win. One-way results are used only
+    # when no usable round-trip result exists.
+    # ------------------------------------------------------------
+
+    if round_trip_results:
+        combined_flight_data = "\n\n".join(round_trip_results)
+        search_mode = "round_trip"
+    elif fallback_one_way_results:
+        combined_flight_data = "\n\n".join(fallback_one_way_results)
+        search_mode = "one_way_fallback"
+    else:
+        combined_flight_data = (
+            "No usable flight results were returned for the requested "
+            "airport combinations."
+        )
+        search_mode = "none"
+
+    print("\n========== GOOGLE FLIGHTS RESULT ==========")
+    print("Search mode:", search_mode)
+    print(combined_flight_data[:16000])
+    print("===========================================\n")
+
+    # ------------------------------------------------------------
+    # LLM formatting
+    # ------------------------------------------------------------
 
     prompt = f"""
 Answer ONLY the user's flight-related request.
-Do not create an itinerary, hotel plan, general trip budget, weather plan, or activity plan.
-If the user gave a fare limit such as "under INR 50,000", treat it only as a flight-price constraint.
-If exact fares are not available from the supplied MCP data, clearly say that instead of inventing prices.
+
+Do not create an itinerary, hotel plan, general trip budget,
+weather plan, or activity plan.
+
+Search mode:
+{search_mode}
+
+The flight data below comes from the Google Flights MCP.
+
+IMPORTANT:
+- If search mode is "round_trip", present ONLY the round-trip
+  flight results.
+- If search mode is "one_way_fallback", explain that no usable
+  round-trip result was found and present the outbound and return
+  one-way searches separately.
+- NEVER combine two one-way fares and call the result a verified
+  round-trip fare.
+- Do NOT invent a round-trip total from one-way prices.
+
+Use ONLY the supplied flight data.
+
+Do NOT invent:
+- flight numbers
+- airlines
+- prices
+- departure times
+- arrival times
+- durations
+- stops
+- availability
+
+If information is unavailable, say so.
 
 User request:
 {query}
@@ -547,29 +1098,57 @@ User request:
 Trip constraints:
 {constraints}
 
-Airport MCP data:
-{str(airports)[:3000]}
+Resolved origin:
+{origin_input} -> {[airport.iata for airport in origin_airports]}
 
-Airline MCP data:
-{str(airlines)[:3000]}
+Resolved destination:
+{destination_input} -> {[airport.iata for airport in destination_airports]}
 
-Include:
+Google Flights MCP data:
+{combined_flight_data[:16000]}
 
-- likely departure/arrival airports
-- relevant airlines
-- estimated duration
-- fare range
-- peak season warning
-- booking advice relevant to the requested flight
+When data is available, include:
+- airline
+- departure time
+- arrival time
+- duration
+- number of stops
+- price
+- flight type
+- Google Flights link
 
-Do not discuss hotels, sightseeing, day-by-day itineraries, or an overall trip budget.
+If multiple airports were searched, clearly identify
+which airport each option uses.
+
+For round-trip results, clearly state that the price is the
+round-trip price when the MCP data says so.
+
+For one-way fallback results, keep:
+- outbound ({departure_date}: {origin_input} -> {destination_input})
+- return ({return_date}: {destination_input} -> {origin_input})
+separate.
+
+Do not discuss hotels, sightseeing, day-by-day itineraries,
+weather, or the overall trip budget.
+
 The response does not need to be JSON.
 """
 
-    result = await _llm_text_async(
-        "You are a flight planning specialist.",
-        prompt,
-    )
+    try:
+        result = await _llm_text_async(
+            "You are a flight search and comparison specialist. "
+            "Use only verified MCP flight data and never fabricate flight details. "
+            "Prefer round-trip results; one-way data is fallback only.",
+            prompt,
+        )
+
+    except Exception as exc:
+        print(
+            f"Flight result formatting failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        result = combined_flight_data
 
     print("\n========== FLIGHT AGENT OUTPUT ==========")
     print(result)
@@ -601,6 +1180,7 @@ async def hotel_agent(state: TravelState):
 
     try:
         result = await tavily_search(query)
+        result = _format_tavily_result(result)
     except Exception as exc:
         print(f"Hotel search failed: {type(exc).__name__}: {exc}")
         result = "Hotel search data is currently unavailable."
@@ -610,7 +1190,7 @@ async def hotel_agent(state: TravelState):
     print("=========================================\n")
 
     return {
-        "hotel_results": str(result),
+        "hotel_results": result,
         "messages": [
             AIMessage(content="Hotel agent completed.")
         ],

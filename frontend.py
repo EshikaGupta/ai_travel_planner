@@ -479,6 +479,9 @@ with st.sidebar:
         index=["openai", "gemini", "groq"].index(st.session_state.llm_provider),
         label_visibility="collapsed",
     )
+    from config import set_provider
+
+    set_provider(st.session_state.llm_provider)
 
     st.markdown('<div class="sidebar-muted">Powered by</div>', unsafe_allow_html=True)
     for item in [
@@ -590,6 +593,8 @@ query = st.text_area(
 
 st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
+streamed_this_run = False
+
 if st.button("🚀 Generate My Travel Plan", type="primary", use_container_width=True):
     if not query.strip():
         st.warning("Please enter a travel request first.")
@@ -614,8 +619,53 @@ if st.button("🚀 Generate My Travel Plan", type="primary", use_container_width
 
         with st.status("🤖 Running the travel agents...", expanded=True) as status:
             try:
-                result = app.invoke(input_state, config=config)
-                status.update(label="✅ Request completed", state="complete", expanded=False)
+                result = None
+
+                for mode, chunk in app.stream(
+                    input_state,
+                    config=config,
+                    stream_mode=["custom", "values"],
+                ):
+                    if mode == "custom" and isinstance(chunk, dict):
+                        if chunk.get("type") == "agent_result":
+                            agent = chunk.get("agent", "")
+                            content = chunk.get("content", "")
+
+                            titles = {
+                                "flight_agent": "✈️ Flight Information",
+                                "hotel_agent": "🏨 Hotel Information",
+                                "weather_agent": "🌤️ Weather Information",
+                                "budget_agent": "💰 Budget Analysis",
+                                "itinerary_agent": "🗓️ Draft Itinerary",
+                            }
+
+                            if content:
+                                streamed_this_run = True
+                                title = titles.get(
+                                    agent,
+                                    agent.replace("_", " ").title(),
+                                )
+
+                                with st.expander(title, expanded=True):
+                                    st.markdown(str(content))
+
+                                status.update(
+                                    label=f"✅ {title} completed",
+                                    state="running",
+                                    expanded=True,
+                                )
+
+                    elif mode == "values" and isinstance(chunk, dict):
+                        result = chunk
+
+                status.update(
+                    label="⏸️ Waiting for human approval"
+                    if result and "__interrupt__" in result
+                    else "✅ Request completed",
+                    state="complete",
+                    expanded=False,
+                )
+
             except Exception as exc:
                 status.update(label="❌ Request failed", state="error", expanded=True)
                 st.exception(exc)
@@ -636,8 +686,6 @@ if st.button("🚀 Generate My Travel Plan", type="primary", use_container_width
                     "created_at": datetime.now().strftime("%d %b %Y, %H:%M"),
                 }
             )
-
-            st.rerun()
 
 
 # ============================================================
@@ -680,16 +728,10 @@ if result:
         if agent in selected_agents and text
     ]
 
-    if visible_sections:
-        cols = st.columns(min(2, len(visible_sections)))
-        for index, (_, title, text) in enumerate(visible_sections):
-            with cols[index % len(cols)]:
-                st.markdown(
-                    f'<div class="result-card"><div class="result-title">{title}</div>',
-                    unsafe_allow_html=True,
-                )
-                st.markdown(text)
-                st.markdown("</div>", unsafe_allow_html=True)
+    if visible_sections and not streamed_this_run:
+        for _, title, text in visible_sections:
+            with st.expander(title, expanded=True):
+                st.markdown(str(text))
 
     # Itinerary only exists for explicit planning requests.
     draft = result.get("itinerary", "")
@@ -701,9 +743,10 @@ if result:
             except AttributeError:
                 pass
 
-    if draft:
+    if draft and not streamed_this_run:
         st.markdown('<div class="section-label">🗓️ Draft itinerary</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="final-card">{draft}</div>', unsafe_allow_html=True)
+        with st.expander("🗓️ Draft Itinerary", expanded=True):
+            st.markdown(str(draft))
 
     # Small metrics row.
     agents_run = len(selected_agents)
@@ -787,10 +830,8 @@ final_result = st.session_state.get("latest_result")
 if final_result and final_result.get("final_response"):
     st.markdown("---")
     st.markdown('<div class="section-label">✨ Final travel plan</div>', unsafe_allow_html=True)
-    st.markdown(
-        f'<div class="final-card">{final_result["final_response"]}</div>',
-        unsafe_allow_html=True,
-    )
+    with st.container(border=True):
+        st.markdown(str(final_result["final_response"]))
 
     st.download_button(
         "⬇️ Download response",
