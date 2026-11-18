@@ -15,3 +15,5 @@ venv/
 # macOS
 .DS_Store
 aviationstack-mcp/
+logs/
+google-flights-mcp/
