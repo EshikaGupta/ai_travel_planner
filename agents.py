@@ -3,7 +3,7 @@ import json
 import re
 from datetime import datetime, timedelta
 from typing import Any, Literal
-
+from langsmith import traceable
 from pydantic import BaseModel, Field
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -20,6 +20,44 @@ from mcp_client import (
 from state import TravelState
 from airport_resolver import resolve_airports
 from config import get_llm, get_active_provider
+
+def _format_weather_response(current_data, forecast_data):
+
+    current_text = _tool_result_text(current_data)
+    forecast_text = _tool_result_text(forecast_data)
+
+    try:
+        current = json.loads(current_text)
+        forecast = json.loads(forecast_text)
+    except (json.JSONDecodeError, TypeError):
+        return f"""
+### Current Weather
+{current_text}
+
+### Forecast
+{forecast_text}
+"""
+
+    lines = [
+        f"## Weather in {current.get('city', 'Unknown')}",
+        "",
+        "### Current Conditions",
+        f"- Temperature: {current.get('temperature_c')}°C",
+        f"- Feels like: {current.get('feels_like_c')}°C",
+        f"- Condition: {current.get('condition')}",
+        f"- Humidity: {current.get('humidity')}%",
+        f"- Wind speed: {current.get('wind_speed')} m/s",
+        "",
+        "### Forecast",
+    ]
+
+    for item in forecast.get("forecast", []):
+        lines.append(
+            f"- {item['datetime']}: "
+            f"{item['temperature']}°C, {item['weather']}"
+        )
+
+    return "\n".join(lines)
 
 def _get_llm():
     return get_llm(get_active_provider())
@@ -55,6 +93,26 @@ class SupervisorOutput(BaseModel):
     trip_constraints: TripConstraints = Field(default_factory=TripConstraints)
     reasoning: str = ""
 
+def _get_weather_city(state: TravelState) -> str:
+    constraints = state.get("trip_constraints") or {}
+
+    city = (constraints.get("destination") or "").strip()
+
+    if city:
+        return city
+
+    query = state.get("user_query", "")
+
+    match = re.search(
+        r"\b(?:in|at|for)\s+([A-Za-z][A-Za-z\s-]*?)(?:[?.!,]|$)",
+        query,
+        re.IGNORECASE,
+    )
+
+    if match:
+        return match.group(1).strip()
+
+    return ""
 
 def _run_async(coro):
     """Run an async MCP call from a synchronous LangGraph node."""
@@ -163,7 +221,7 @@ def _format_tavily_result(result: Any) -> str:
 
 
 def _content_to_text(content: Any) -> str:
-    """Normalize LangChain content from Gemini, Groq, OpenAI, etc. to text."""
+    """Normalize LangChain content from Gemini, Groq, etc. to text."""
     if content is None:
         return ""
     if isinstance(content, str):
@@ -214,7 +272,7 @@ async def _llm_text_async(system: str, prompt: str) -> str:
     except Exception as exc:
         raise RuntimeError(f"LLM invocation failed: {exc}") from exc
 
-
+@traceable(name="Structured LLM invocation", run_type="chain")
 def _structured_invoke(model_class, system: str, prompt: str):
     """Use provider-native structured output, with a safe text fallback."""
     model = _get_llm()
@@ -243,14 +301,37 @@ def _structured_invoke(model_class, system: str, prompt: str):
 
         raw = result.get("raw") if isinstance(result, dict) else result
         raw_text = _content_to_text(getattr(raw, "content", raw)).strip()
-        return _json_fallback(raw_text, model_class)
+
+        if raw_text:
+            return _json_fallback(raw_text, model_class)
 
     except Exception as exc:
-        # Some provider/model combinations may not expose structured output.
-        # Keep the application working by falling back to normal text output.
-        print(f"Structured output unavailable: {type(exc).__name__}: {exc}")
-        raw_text = _llm_text(system, prompt)
-        return _json_fallback(raw_text, model_class)
+        print(
+            f"Structured output unavailable: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    # Explicit JSON fallback
+    fallback_prompt = f"""
+    {system}
+
+    {prompt}
+
+    IMPORTANT OUTPUT REQUIREMENTS:
+    - Return ONLY one valid JSON object.
+    - Do not use Markdown.
+    - Do not use bold formatting.
+    - Do not add explanations before or after the JSON.
+    - Use double quotes around all JSON keys and string values.
+    - Use null for missing values.
+    """
+
+    raw_text = _llm_text(
+        "You are a strict JSON generator. Return valid JSON only.",
+        fallback_prompt,
+    )
+
+    return _json_fallback(raw_text, model_class)
 
 
 def _json_fallback(text: str, model_class):
@@ -266,21 +347,28 @@ def _json_fallback(text: str, model_class):
         .strip()
     )
 
+    # First attempt: direct JSON parsing
     try:
         data = json.loads(cleaned)
     except json.JSONDecodeError:
         decoder = json.JSONDecoder()
         data = None
+
+        # Second attempt: extract a JSON object from surrounding text
         for index, character in enumerate(cleaned):
             if character != "{":
                 continue
+
             try:
                 data, _ = decoder.raw_decode(cleaned[index:])
                 break
             except json.JSONDecodeError:
                 continue
+
         if data is None:
-            raise ValueError(f"Could not parse JSON from LLM response:\n{text}")
+            raise ValueError(
+                f"Could not parse JSON from LLM response:\n{text}"
+            )
 
     if not isinstance(data, dict):
         raise ValueError("Expected a JSON object from the LLM.")
@@ -370,7 +458,7 @@ def _fallback_supervisor(query: str) -> dict:
 # ============================================================
 # SUPERVISOR AGENT
 # ============================================================
-
+@traceable(name="Supervisor Agent", run_type="chain")
 def supervisor_agent(state: TravelState):
     query = state["user_query"]
 
@@ -588,7 +676,7 @@ User request:
 # ============================================================
 # FLIGHT AGENT
 # ============================================================
-
+@traceable(name="Flight Agent", run_type="chain")
 async def flight_agent(state: TravelState):
     query = state["user_query"]
     constraints = state["trip_constraints"]
@@ -1166,7 +1254,7 @@ The response does not need to be JSON.
 # ============================================================
 # HOTEL AGENT
 # ============================================================
-
+@traceable(name="Hotel Agent", run_type="chain")
 async def hotel_agent(state: TravelState):
     query = (
         f"Find hotel/accommodation information relevant to this request. "
@@ -1200,46 +1288,40 @@ async def hotel_agent(state: TravelState):
 # ============================================================
 # WEATHER AGENT
 # ============================================================
-
+@traceable(name="Weather Agent", run_type="chain")
 async def weather_agent(state: TravelState):
-    constraints = state["trip_constraints"]
-    city = constraints.get("destination", "")
+
+    city = _get_weather_city(state)
 
     print("\n========== WEATHER AGENT INPUT ==========")
-    print("City:", city)
+    print("User query:", state.get("user_query"))
+    print("Extracted city:", city)
     print("=========================================\n")
+
+    if not city:
+        result = "Please specify a city for the weather search."
+
+        return {
+            "weather_results": result,
+            "messages": [AIMessage(content=result)],
+        }
 
     try:
         weather_data = await current_weather(city)
     except Exception as exc:
-        print(f"Current weather lookup failed: {type(exc).__name__}: {exc}")
+        print(f"Current weather lookup failed: {exc}")
         weather_data = "Current weather data unavailable."
 
     try:
         forecast_data = await forecast(city)
     except Exception as exc:
-        print(f"Forecast lookup failed: {type(exc).__name__}: {exc}")
+        print(f"Forecast lookup failed: {exc}")
         forecast_data = "Forecast data unavailable."
 
-    print("\n========== CURRENT WEATHER ==========")
-    print(weather_data)
-    print("=====================================\n")
-
-    print("\n========== WEATHER FORECAST ==========")
-    print(forecast_data)
-    print("======================================\n")
-
-    result = f"""
-Current weather:
-{weather_data}
-
-Forecast:
-{forecast_data}
-"""
-
-    print("\n========== WEATHER AGENT OUTPUT ==========")
-    print(result)
-    print("==========================================\n")
+    result = result = _format_weather_response(
+        weather_data,
+        forecast_data,
+    )
 
     return {
         "weather_results": result,
@@ -1248,11 +1330,10 @@ Forecast:
         ],
     }
 
-
 # ============================================================
 # BUDGET AGENT
 # ============================================================
-
+@traceable(name="Budget Agent", run_type="chain")
 def budget_agent(state: TravelState):
 
     print("\n========== BUDGET AGENT INPUT ==========")
@@ -1317,6 +1398,7 @@ Return a concise budget assessment with:
 # ITINERARY AGENT
 # ============================================================
 
+@traceable(name="Itinerary Agent", run_type="chain")
 def itinerary_agent(state: TravelState):
 
     print("\n========== ITINERARY AGENT INPUT ==========")
@@ -1399,6 +1481,7 @@ Reply with approval or feedback.
 # HUMAN APPROVAL AGENT
 # ============================================================
 
+@traceable(name="Human Approval Agent", run_type="chain")
 def human_approval_agent(state: TravelState):
 
     feedback = interrupt(
@@ -1437,7 +1520,7 @@ def human_approval_agent(state: TravelState):
 # ============================================================
 # FINAL RESPONSE AGENT
 # ============================================================
-
+@traceable(name="Final Response Agent", run_type="chain")
 def final_response_agent(state: TravelState):
 
     print("\n========== FINAL AGENT INPUT ==========")

@@ -31,13 +31,13 @@ PostgreSQL.
     and conversation resumption.
 -   **Streamlit Interface:** Provides an interactive UI for planning
     trips and reviewing agent outputs.
--   **Multiple LLM Providers:** Supports Gemini, Groq, and OpenAI.
+-   **Multiple LLM Providers:** Supports Gemini, and Groq.
 
 ## Tech Stack
 
 -   **Language:** Python
 -   **Agent Orchestration:** LangGraph, LangChain
--   **LLM Providers:** Google Gemini, Groq, OpenAI
+-   **LLM Providers:** Google Gemini, Groq
 -   **Tool Integration:** MCP, LangChain MCP Adapters
 -   **Search:** Tavily
 -   **Weather API:** OpenWeatherMap
@@ -147,7 +147,7 @@ DATABASE_URL=postgresql://username:password@localhost:5432/langgraph_memory_demo
 ```
 
 The application also supports provider configuration through
-`LLM_PROVIDER` (`gemini`, `groq`, or `openai`). Provider-specific model
+`LLM_PROVIDER` (`gemini`, or `groq`). Provider-specific model
 settings and temperature can be configured through the variables read in
 `config.py`.
 

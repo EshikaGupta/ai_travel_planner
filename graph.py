@@ -3,7 +3,7 @@ import asyncio
 import psycopg
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.graph import END, START, StateGraph
-
+from langgraph.config import get_stream_writer
 from agents import (
     budget_agent,
     final_response_agent,
@@ -39,13 +39,31 @@ async def _parallel_specialist_agents(state: TravelState):
     tasks = []
 
     if "flight_agent" in selected:
-        tasks.append(flight_agent(state))
+        tasks.append(
+            _run_and_stream(
+                "flight_agent",
+                flight_agent(state),
+                "flight_results",
+            )
+        )
 
     if "hotel_agent" in selected:
-        tasks.append(hotel_agent(state))
+        tasks.append(
+            _run_and_stream(
+                "hotel_agent",
+                hotel_agent(state),
+                "hotel_results",
+            )
+        )
 
     if "weather_agent" in selected:
-        tasks.append(weather_agent(state))
+        tasks.append(
+            _run_and_stream(
+                "weather_agent",
+                weather_agent(state),
+                "weather_results",
+            )
+        )
 
     if not tasks:
         return {}
@@ -82,14 +100,47 @@ def route_after_budget(state: TravelState) -> str:
 
     return END
 
+def _emit_agent_result(agent_name: str, result: dict, result_key: str):
+    """Send a completed agent result to the frontend immediately."""
+    content = result.get(result_key, "")
+
+    if not content:
+        return
+
+    writer = get_stream_writer()
+    writer({
+        "type": "agent_result",
+        "agent": agent_name,
+        "content": content,
+    })
+
+
+async def _run_and_stream(agent_name: str, coro, result_key: str):
+    """Run a specialist and stream its result as soon as it finishes."""
+    result = await coro
+    _emit_agent_result(agent_name, result, result_key)
+    return result
+
+
+def budget_agent_with_stream(state: TravelState):
+    result = budget_agent(state)
+    _emit_agent_result("budget_agent", result, "budget_results")
+    return result
+
+
+def itinerary_agent_with_stream(state: TravelState):
+    result = itinerary_agent(state)
+    _emit_agent_result("itinerary_agent", result, "itinerary")
+    return result
+
 
 def build_graph():
     graph = StateGraph(TravelState)
 
     graph.add_node("supervisor", supervisor_agent)
     graph.add_node("parallel_specialists", parallel_specialist_agents)
-    graph.add_node("budget_agent", budget_agent)
-    graph.add_node("itinerary_agent", itinerary_agent)
+    graph.add_node("budget_agent", budget_agent_with_stream)
+    graph.add_node("itinerary_agent", itinerary_agent_with_stream)
     graph.add_node("human_approval", human_approval_agent)
     graph.add_node("final_response", final_response_agent)
 

@@ -2,11 +2,11 @@ import os
 import sys
 from datetime import datetime, timezone
 from typing import Any, Literal
-
+import json
 from dotenv import load_dotenv
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from pydantic import BaseModel
-
+from langsmith import traceable
 from config import (
     OPENWEATHER_API_KEY,
     TAVILY_API_KEY,
@@ -35,6 +35,28 @@ GOOGLE_FLIGHTS_SERVER = os.path.join(
     "server.py",
 )
 
+def _get_mcp_error(raw):
+    if not isinstance(raw, list):
+        return None
+
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+
+        text = item.get("text")
+
+        if not isinstance(text, str):
+            continue
+
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+
+        if isinstance(payload, dict) and payload.get("error"):
+            return payload["error"]
+
+    return None
 
 class ToolResult(BaseModel):
     status: Literal["ok", "error", "no_data"]
@@ -90,7 +112,7 @@ def _exception_text(exc: BaseException) -> str:
 
     return f"{type(exc).__name__}: {exc}"
 
-
+@traceable(name="MCP tool execution", run_type="tool")
 async def _call_server_tool(
     server_name: str,
     tool_name: str,
@@ -121,7 +143,16 @@ async def _call_server_tool(
             )
 
         raw = await tool.ainvoke(args or {})
+        mcp_error = _get_mcp_error(raw)
 
+        if mcp_error:
+            return ToolResult(
+                status="error",
+                source=source,
+                timestamp=_timestamp(),
+                error=mcp_error,
+            )
+        
         if raw is None or raw == "" or raw == [] or raw == {}:
             return ToolResult(
                 status="no_data",

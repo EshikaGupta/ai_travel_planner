@@ -29,7 +29,7 @@ def init_state():
     defaults = {
         "user_id": "demo_user",
         "thread_id": None,
-        "llm_provider": "openai",
+        "llm_provider": "gemini",
         "latest_result": None,
         "waiting_for_approval": False,
         "history": [],
@@ -475,8 +475,8 @@ with st.sidebar:
     st.markdown('<div class="sidebar-muted">LLM</div>', unsafe_allow_html=True)
     st.session_state.llm_provider = st.selectbox(
         "Select LLM",
-        ["openai", "gemini", "groq"],
-        index=["openai", "gemini", "groq"].index(st.session_state.llm_provider),
+        ["gemini", "groq"],
+        index=["gemini", "groq"].index(st.session_state.llm_provider),
         label_visibility="collapsed",
     )
     from config import set_provider
@@ -486,7 +486,7 @@ with st.sidebar:
     st.markdown('<div class="sidebar-muted">Powered by</div>', unsafe_allow_html=True)
     for item in [
         "🔗 LangGraph",
-        "🧠 OpenAI / Gemini / Groq",
+        "🧠 Gemini / Groq",
         "🐘 PostgreSQL",
         "🔎 Tavily Search",
         "✈️ AviationStack",

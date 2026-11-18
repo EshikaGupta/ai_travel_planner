@@ -17,3 +17,4 @@ uv
 mcp
 requests
 langchain-groq
+langsmith
