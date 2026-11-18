@@ -1,215 +1,256 @@
-# Build a Multi-Agent Travel Planning System using LangGraph + MCP
+# AI Travel Planner
+
+A multi-agent AI travel planning system built using **LangGraph, MCP
+(Model Context Protocol), and LLMs**. It uses specialized agents to help
+users plan trips by researching flights, hotels, weather conditions,
+budgets, and itineraries.
+
+The application includes human approval before presenting the final
+travel plan and supports persistent conversation state through
+PostgreSQL.
+
+## Features
+
+-   **Multi-Agent Architecture:** Uses LangGraph to coordinate
+    specialized travel-planning agents.
+-   **Supervisor Agent:** Understands the user's request, extracts trip
+    constraints, and selects the relevant agents.
+-   **Flight Search:** Integrates with Google Flights MCP to search
+    one-way and round-trip flights.
+-   **Hotel Research:** Uses Tavily search to find accommodation options
+    and relevant information.
+-   **Weather Information:** Uses a custom OpenWeatherMap MCP server to
+    retrieve current weather and forecasts.
+-   **Budget Analysis:** Estimates and analyses trip expenses using an
+    LLM and the available specialist results.
+-   **Itinerary Generation:** Generates a travel itinerary based on the
+    user's preferences and research results.
+-   **Human-in-the-Loop:** Allows users to review and approve the
+    proposed plan or provide feedback.
+-   **PostgreSQL Checkpointing:** Supports persistent LangGraph state
+    and conversation resumption.
+-   **Streamlit Interface:** Provides an interactive UI for planning
+    trips and reviewing agent outputs.
+-   **Multiple LLM Providers:** Supports Gemini, Groq, and OpenAI.
+
+## Tech Stack
+
+-   **Language:** Python
+-   **Agent Orchestration:** LangGraph, LangChain
+-   **LLM Providers:** Google Gemini, Groq, OpenAI
+-   **Tool Integration:** MCP, LangChain MCP Adapters
+-   **Search:** Tavily
+-   **Weather API:** OpenWeatherMap
+-   **Flight Search:** Google Flights MCP
+-   **Database:** PostgreSQL, LangGraph Checkpoint Postgres
+-   **Frontend:** Streamlit
+
+## Architecture
+
+The application follows a supervisor-based multi-agent architecture.
+
+1.  **Supervisor Agent:** Analyses the user's request, identifies trip
+    constraints, and determines which specialist agents are required.
+2.  **Specialist Agents:** Flight, hotel, and weather agents execute
+    their respective tasks. These agents can run concurrently.
+3.  **Budget Agent:** Analyses estimated costs using the user's
+    requirements and specialist results.
+4.  **Itinerary Agent:** Creates a structured itinerary using the
+    available research and trip constraints.
+5.  **Human Approval:** Presents the proposed plan for user approval or
+    feedback.
+6.  **Final Response Agent:** Generates the final response based on the
+    approval status and any feedback.
+
+The workflow is implemented using LangGraph conditional routing,
+parallel execution, and human-in-the-loop interrupts.
+
+## Project Structure
+
+``` text
+ai_travel_planner/
+│
+├── agents.py                       # Agent definitions and LLM logic
+├── airport_resolver.py             # Airport and IATA code resolution
+├── config.py                       # LLM and API configuration
+├── custom_meather_mcp_server.py    # Custom OpenWeatherMap MCP server
+├── frontend.py                     # Streamlit application
+├── graph.py                        # LangGraph workflow and orchestration
+├── mcp_client.py                   # MCP client and tool integrations
+├── state.py                        # Shared graph state
+│
+├── aviationstack-mcp/               # Existing submodule
+├── requirements.txt
+├── .env.example
+├── .gitignore
+└── README.md
+```
+
+## Prerequisites
+
+-   Python 3.10+
+-   PostgreSQL (optional; required for persistent checkpointing)
+-   API keys for the services you intend to use:
+    -   Google Gemini
+    -   Tavily
+    -   OpenWeatherMap
+-   Google Flights MCP server set up locally
+
+## Installation and Setup
+
+### 1. Clone the repository
 
-This project, Multi-Agent AI Travel Planner is built using MCP (Model Context Protocol) servers for real-time flight and weather data.
+``` bash
+git clone https://github.com/EshikaGupta/ai_travel_planner.git
+cd ai_travel_planner
+```
 
----
+### 2. Create and activate a virtual environment
 
-# Requirements
+``` bash
+python -m venv .venv
+```
 
-## APIs
+Windows:
 
-- Tavily API: https://www.tavily.com/
-- AviationStack API: https://aviationstack.com/
-- OpenWeatherMap API: https://openweathermap.org/
+``` bash
+.venv\Scripts\activate
+```
 
-## Tools
+Linux/macOS:
 
-- PostgreSQL: https://www.postgresql.org/download/
-- Tavily MCP Server: https://docs.tavily.com/documentation/mcp
+``` bash
+source .venv/bin/activate
+```
 
----
+### 3. Install dependencies
 
-# Step 1: Create Python Environment
+``` bash
+pip install -r requirements.txt
+```
 
+### 4. Configure environment variables
 
-    python -m venv langgraph_env3
+Create a `.env` file in the project root using `.env.example` as a
+reference.
 
+``` env
+GEMINI_API_KEY=your_gemini_api_key
+GEMINI_MODEL=your_gemini_model
 
-Activate:
+TAVILY_API_KEY=your_tavily_api_key
+OPENWEATHER_API_KEY=your_openweathermap_api_key
 
+AVIATIONSTACK_API_KEY=your_aviationstack_api_key
 
-    venv\Scripts\activate.bat
+DATABASE_URL=postgresql://username:password@localhost:5432/langgraph_memory_demo
+```
 
+The application also supports provider configuration through
+`LLM_PROVIDER` (`gemini`, `groq`, or `openai`). Provider-specific model
+settings and temperature can be configured through the variables read in
+`config.py`.
 
----
+### 5. Set up the Google Flights MCP server
 
-# Step 2: Install Dependencies
+The flight integration currently uses a separate Google Flights MCP
+server, not the AviationStack MCP submodule.
 
+The application expects the server at:
 
-    pip install langgraph langchain langchain-openai langchain-groq langchain-community langchain-tavily psycopg[binary] psycopg_pool python-dotenv tavily-python requests streamlit
+``` text
+ai_travel_planner/
+└── google-flights-mcp/
+    └── src/
+        └── mcp_server_google_flights/
+            └── server.py
+```
 
+The MCP client also expects the server's Python environment at:
 
+``` text
+google-flights-mcp/.venv/Scripts/python.exe
+```
 
-    pip install -U "psycopg[binary,pool]" langgraph-checkpoint-postgres
+Set up the Google Flights MCP project separately and ensure its server
+file and Python environment are available at these expected paths.
+Update the paths in `mcp_client.py` if your setup differs.
 
+### 6. Weather MCP server
 
----
+The project includes a custom OpenWeatherMap MCP server in:
 
-# Step 3: Install PostgreSQL
+``` text
+custom_meather_mcp_server.py
+```
 
-Download PostgreSQL:
+It exposes tools for:
 
-https://www.postgresql.org/download/
+-   `get_current_weather(city)`
+-   `get_forecast(city)`
 
-**Important:** Note your PostgreSQL password and port number during installation.
+The server is launched by the MCP client, so it does not need to be
+started separately. Ensure `OPENWEATHER_API_KEY` is configured.
 
----
+### 7. Tavily integration
 
-# Step 4: Create Database
+Tavily is integrated through its hosted MCP endpoint in `mcp_client.py`.
+Configure `TAVILY_API_KEY` in your `.env` file. A separate local Tavily
+MCP server installation is not required.
 
+### 8. PostgreSQL setup (optional)
 
-    CREATE DATABASE langgraph_memory_demo;
+PostgreSQL is used for persistent LangGraph checkpointing.
 
+Create a database:
 
----
+``` sql
+CREATE DATABASE langgraph_memory_demo;
+```
 
-# Step 5: Setup .env File
+Configure `DATABASE_URL` in your `.env` file.
 
-Create a `.env` file:
+If `DATABASE_URL` is configured, the application uses `PostgresSaver`
+for checkpoint persistence. Without it, the graph runs without
+PostgreSQL persistence.
 
-    GEMINI_API_KEY=your_gemini_api_key
+## Running the Application
 
-    TAVILY_API_KEY=your_tavily_api_key
+Launch the Streamlit interface from the project root:
 
-    AVIATIONSTACK_API_KEY=your_aviationstack_api_key
+``` bash
+streamlit run frontend.py
+```
 
-    DATABASE_URL=postgresql://postgres:postgres@localhost:5432/langgraph_memory_demo
+The interface allows users to:
 
+-   Enter travel requirements and preferences.
+-   Select an LLM provider.
+-   Follow the progress of the specialist agents.
+-   Review research results and the generated itinerary.
+-   Approve the proposed plan or provide feedback.
+-   View and download the final travel plan.
 
----
+## Example Query
 
-# Step 6: Get API Keys
+``` text
+Plan a 5-day trip to Japan from Delhi with a budget of
+₹1,00,000. I prefer cultural experiences, local food,
+and comfortable accommodation.
+```
 
-- Tavily: https://tavily.com
-- AviationStack: https://aviationstack.com
-- OpenWeatherMap: https://openweathermap.org/
+The supervisor analyses the request and routes it to the relevant
+agents. The system researches available travel information, estimates
+the budget, generates an itinerary, and requests user approval before
+producing the final response.
 
----
+## Notes
 
-# Setup AviationStack MCP Server (Local MCP Server)
-
-Repository:
-
-https://github.com/Pradumnasaraf/aviationstack-mcp
-
-Open PowerShell:
-
-    E:
-
-    cd E:\Multi_agent_system_with_MCP
-
-
-Clone repository:
-
-
-    git clone https://github.com/Pradumnasaraf/aviationstack-mcp.git
-
-    cd aviationstack-mcp
-
-
-## Install UV
-
-Check:
-
-    uv --version
-
-
-Install:
-
-    pip install uv
-
-
-If installation fails:
-
-    powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-
-
-## Create .env File
-
-    AVIATION_STACK_API_KEY=your_api_key_here
-
-
-## Install Dependencies
-
-    uv sync
-
-
-This will:
-
-- Create `.venv`
-- Install dependencies
-- Install AviationStack MCP package
-
-## Activate Environment
-
-    .venv\Scripts\activate
-
-
-## Start MCP Server
-
-    uv run -m aviationstack_mcp mcp run
-
-
-or
-
-
-    python -m aviationstack_mcp mcp run
-
-
-The server will remain running and wait for MCP requests.
-
-## Stop Server
-
-    CTRL + C
-
-
----
-
-# Setup Weather MCP Server
-
-Get API key:
-
-https://openweathermap.org/
-
-Add the API key to your `.env` file.
-
-Install dependencies:
-
-    pip install mcp requests
-
-
----
-
-# Run the Application
-
-## Terminal Version
-
-    python main.py
-
-## Streamlit Web App
-
-Copy `frontend.py` from the Part 1 repository into this project.
-
-Run:
-
-    streamlit run frontend.py
-
-
----
-
-# Example Prompt
-
-    Plan a complete 7 days Japan trip including flights, hotels and sightseeing under 2 lakhs.
-
-
----
-
-# Features
-
-- Multi-Agent Architecture using LangGraph
-- PostgreSQL Memory
-- Tavily Search Integration
-- AviationStack MCP Integration
-- Weather MCP Integration
-- Streamlit Web App
-- Real-Time Travel Planning
+-   Flight search depends on the separately configured Google Flights
+    MCP server.
+-   Hotel research uses web search results and does not represent
+    verified hotel availability or booking.
+-   Budget estimates are LLM-generated estimates, not guaranteed prices.
+-   PostgreSQL persistence is optional; without a configured database,
+    conversation checkpointing is not persisted across application
+    restarts.
