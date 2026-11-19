@@ -3,11 +3,9 @@ langchain
 langchain-openai 
 langchain-groq 
 langchain-community 
-langchain-tavily 
 psycopg[binary] 
 psycopg_pool 
-python-dotenv 
-tavily-python 
+python-dotenv  
 requests 
 langchain-google-genai
 streamlit

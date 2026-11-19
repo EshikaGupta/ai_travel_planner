@@ -488,8 +488,8 @@ with st.sidebar:
         "🔗 LangGraph",
         "🧠 Gemini / Groq",
         "🐘 PostgreSQL",
-        "🔎 Tavily Search",
-        "✈️ AviationStack",
+        "🔎 Google Hotels API",
+        "✈️ Google Flights API",
     ]:
         st.markdown(f'<div class="sidebar-tech">{item}</div>', unsafe_allow_html=True)
 

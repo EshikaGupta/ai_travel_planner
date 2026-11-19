@@ -16,6 +16,7 @@ class TravelState(TypedDict, total=False):
     weather_results: str
     budget_results: str
     itinerary: str
+    hotel_options: list[dict]
 
     approval_request: str
     human_feedback: str

@@ -75,6 +75,38 @@ def _load_country_names() -> dict[str, str]:
 
     return countries
 
+def get_country_code(country_name: str) -> str | None:
+    countries = _load_country_names()
+
+    country_name = _normalise(country_name)
+
+    for code, name in countries.items():
+        if _normalise(name) == country_name:
+            return code
+
+    return None
+
+def get_airports_by_country(
+    country_code: str,
+    max_results: int = 5,
+) -> list[Airport]:
+
+    airports = _load_airports()
+
+    matches = [
+        airport
+        for airport in airports
+        if airport.country_code == country_code.upper()
+    ]
+
+    matches.sort(
+        key=lambda airport: (
+            0 if airport.airport_type == "large_airport" else 1,
+            airport.name,
+        )
+    )
+
+    return matches[:max_results]
 
 def _load_airports() -> list[Airport]:
     _download_if_missing(AIRPORTS_URL, AIRPORTS_FILE)
@@ -168,21 +200,48 @@ def _score_airport(
 
     return score
 
+def validate_airport_iata(
+    iata: str,
+    country_code: str | None = None,
+) -> Airport | None:
+
+    if not iata:
+        return None
+
+    iata = iata.strip().upper()
+
+    airports = _load_airports()
+
+    for airport in airports:
+        if airport.iata != iata:
+            continue
+
+        if country_code and airport.country_code != country_code:
+            return None
+
+        return airport
+
+    return None
 
 def resolve_airports(
     location: str,
     max_results: int = 5,
+    destination_country: str | None = None,
+    destination_airport_iata: str | None = None,
 ) -> list[Airport]:
     """
     Resolve a city, airport name, country, or IATA code to airports.
 
+    destination_country:
+        Optional country identified by the supervisor LLM.
+        Used when the destination is a region/island not present
+        as a municipality in the airport dataset.
+
     Examples:
         Delhi -> [DEL]
         Tokyo -> [HND, NRT]
-        Japan -> [HND, NRT, KIX, ...]
+        Japan -> major airports in Japan
         DEL -> [DEL]
-
-    Returns an empty list when no reliable match is found.
     """
     location = location.strip()
 
@@ -191,6 +250,23 @@ def resolve_airports(
 
     airports = _load_airports()
     q = _normalise(location)
+    city_part = q.split(",", 1)[0].strip()
+
+    # 1. Validate supervisor's preferred airport.
+    if destination_airport_iata:
+        country_code = (
+            get_country_code(destination_country)
+            if destination_country
+            else None
+        )
+
+        preferred_airport = validate_airport_iata(
+            destination_airport_iata,
+            country_code=country_code,
+        )
+
+        if preferred_airport:
+            return [preferred_airport]
 
     # 1. Exact IATA match.
     if len(q) == 3 and q.isalpha():
@@ -203,10 +279,7 @@ def resolve_airports(
         if exact_iata:
             return exact_iata[:max_results]
 
-    # 2. Strip a simple "City, Country" suffix.
-    city_part = q.split(",", 1)[0].strip()
-
-    # 3. Exact municipality match.
+    # 2. Exact municipality match.
     city_matches = [
         airport
         for airport in airports
@@ -222,7 +295,7 @@ def resolve_airports(
         )
         return city_matches[:max_results]
 
-    # 4. Exact airport-name match.
+    # 3. Exact airport-name match.
     name_matches = [
         airport
         for airport in airports
@@ -232,24 +305,50 @@ def resolve_airports(
     if name_matches:
         return name_matches[:max_results]
 
-    # 5. Country match.
-    country_matches = [
-        airport
-        for airport in airports
-        if _normalise(airport.country_name) == q
-    ]
+    # 4. Direct country-name match.
+    country_code = get_country_code(location)
 
-    if country_matches:
-        # For country searches, prefer major airports.
-        country_matches.sort(
-            key=lambda airport: (
-                0 if airport.airport_type == "large_airport" else 1,
-                _normalise(airport.name),
-            )
+    # 5. If the destination is a region/island, use the
+    # country identified by the supervisor.
+    if not country_code and destination_country:
+        country_code = get_country_code(destination_country)
+
+    if country_code:
+        country_airports = get_airports_by_country(
+            country_code,
+            max_results=max_results,
         )
-        return country_matches[:max_results]
 
-    # 6. Fuzzy-ish substring match for airport/city names.
+        # If the destination itself is a country, return its airports.
+        if get_country_code(location):
+            return country_airports
+
+        # For a region/island, only return airports that have
+        # a meaningful name/municipality match within that country.
+        relevant_matches = [
+            airport
+            for airport in airports
+            if airport.country_code == country_code
+            and (
+                q in _normalise(airport.municipality)
+                or q in _normalise(airport.name)
+            )
+        ]
+
+        if relevant_matches:
+            relevant_matches.sort(
+                key=lambda airport: (
+                    0 if airport.airport_type == "large_airport" else 1,
+                    -_score_airport(airport, location),
+                )
+            )
+            return relevant_matches[:max_results]
+
+        # Do not return arbitrary airports from the country for
+        # a region/island destination. That could produce wrong flights.
+        return []
+
+    # 6. Fuzzy substring match.
     candidates = [
         airport
         for airport in airports

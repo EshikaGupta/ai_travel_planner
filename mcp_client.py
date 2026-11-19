@@ -9,7 +9,6 @@ from pydantic import BaseModel
 from langsmith import traceable
 from config import (
     OPENWEATHER_API_KEY,
-    TAVILY_API_KEY,
 )
 
 load_dotenv()
@@ -34,6 +33,8 @@ GOOGLE_FLIGHTS_SERVER = os.path.join(
     "mcp_server_google_flights",
     "server.py",
 )
+
+HASDATA_API_KEY = os.getenv("HASDATA_API_KEY")
 
 def _get_mcp_error(raw):
     if not isinstance(raw, list):
@@ -81,9 +82,12 @@ weather_script = os.path.join(
 
 
 SERVER_CONFIG = {
-    "tavily": {
-        "transport": "streamable_http",
-        "url": f"https://mcp.tavily.com/mcp/?tavilyApiKey={TAVILY_API_KEY}",
+    "google_hotels": {
+    "transport": "streamable_http",
+    "url": "https://mcp.hasdata.com/mcp?apis=google_travel_hotels",
+    "headers": {
+        "x-api-key": HASDATA_API_KEY,
+        },
     },
     "google_flights": {
         "transport": "stdio",
@@ -119,7 +123,7 @@ async def _call_server_tool(
     args: dict | None = None,
 ) -> ToolResult:
     source = {
-        "tavily": "Tavily Search",
+        "google_hotels": "Google Hotels",
         "google_flights": "Google Flights",
         "weather": "OpenWeather",
     }.get(server_name, server_name)
@@ -176,30 +180,30 @@ async def _call_server_tool(
             error=_exception_text(exc),
         )
 
+async def search_google_hotels(
+    destination: str,
+    check_in: str,
+    check_out: str,
+    adults: int = 1,
+    currency: str = "INR",
+    country_code: str | None = None,
+):
+    args = {
+        "q": f"hotels in {destination}",
+        "checkInDate": check_in,
+        "checkOutDate": check_out,
+        "adults": adults,
+        "currency": currency,
+    }
 
-async def tavily_search(query: str) -> ToolResult:
-    if not query.strip():
-        return ToolResult(
-            status="error",
-            source="Tavily Search",
-            timestamp=_timestamp(),
-            error="Search query is empty.",
-        )
-
-    if not TAVILY_API_KEY:
-        return ToolResult(
-            status="error",
-            source="Tavily Search",
-            timestamp=_timestamp(),
-            error="TAVILY_API_KEY is not set.",
-        )
+    if country_code:
+        args["gl"] = country_code.lower()
 
     return await _call_server_tool(
-        "tavily",
-        "tavily_search",
-        {"query": query},
+        "google_hotels",
+        "hasdata_google_travel_hotels_getGoogleHotels",
+        args,
     )
-
 
 async def search_one_way_flights(
     origin: str,

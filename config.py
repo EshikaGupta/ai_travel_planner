@@ -7,8 +7,6 @@ from langchain_groq import ChatGroq
 
 load_dotenv()
 
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
-AVIATIONSTACK_API_KEY = os.getenv("AVIATIONSTACK_API_KEY")
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
@@ -60,6 +58,7 @@ def get_llm(provider):
             model=os.getenv("GROQ_MODEL") or "openai/gpt-oss-20b",
             groq_api_key=key,
             temperature=temperature,
+            max_tokens=int(os.getenv("GROQ_MAX_OUTPUT_TOKENS", "1024"))
         )
 
     # if provider == "openai":

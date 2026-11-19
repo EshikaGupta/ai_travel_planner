@@ -12,10 +12,10 @@ from langgraph.types import interrupt
 from mcp_client import (
     current_weather,
     forecast,
+    search_google_hotels,
     search_one_way_flights,
     search_round_trip_flights,
     generate_google_flights_url,
-    tavily_search,
 )
 from state import TravelState
 from airport_resolver import resolve_airports
@@ -77,6 +77,8 @@ class TripConstraints(BaseModel):
     departure_date: str = ""
     return_date: str = ""
     travel_style: str = ""
+    destination_country: str = ""
+    destination_airport_iata: str = ""
     special_preferences: list[str] = Field(default_factory=list)
 
 
@@ -176,49 +178,6 @@ def _tool_result_text(result: Any) -> str:
         return json.dumps(data, ensure_ascii=False, indent=2)
 
     return _content_to_text(data).strip()
-
-
-def _format_tavily_result(result: Any) -> str:
-    """Turn Tavily's MCP response into readable Markdown."""
-    text = _tool_result_text(result)
-    if not text:
-        return "Hotel search data is currently unavailable."
-
-    try:
-        payload = json.loads(text)
-    except (TypeError, json.JSONDecodeError):
-        return text
-
-    if not isinstance(payload, dict):
-        return text
-
-    sections = []
-
-    answer = payload.get("answer")
-    if isinstance(answer, str) and answer.strip():
-        sections.append(answer.strip())
-
-    for item in payload.get("results", []):
-        if not isinstance(item, dict):
-            continue
-
-        title = str(item.get("title", "")).strip()
-        content = str(item.get("content", "")).strip()
-        url = str(item.get("url", "")).strip()
-
-        if not title and not content:
-            continue
-
-        if title and url:
-            sections.append(f"### [{title}]({url})")
-        elif title:
-            sections.append(f"### {title}")
-
-        if content:
-            sections.append(content)
-
-    return "\n\n".join(sections).strip() or "Hotel search data is currently unavailable."
-
 
 def _content_to_text(content: Any) -> str:
     """Normalize LangChain content from Gemini, Groq, etc. to text."""
@@ -375,6 +334,33 @@ def _json_fallback(text: str, model_class):
 
     return model_class.model_validate(data)
 
+def normalize_trip_dates(constraints: dict) -> dict:
+    """Derive a return date before specialist agents run."""
+
+    departure = constraints.get("departure_date", "")
+    return_date = constraints.get("return_date", "")
+    duration = str(constraints.get("duration", ""))
+
+    if departure and not return_date:
+        match = re.search(
+            r"(\d+)\s*(?:-\s*)?(?:day|days|night|nights)\b",
+            duration.lower(),
+        )
+
+        if match:
+            try:
+                days = int(match.group(1))
+                departure_dt = datetime.strptime(
+                    departure, "%Y-%m-%d"
+                )
+                constraints["return_date"] = (
+                    departure_dt + timedelta(days=days)
+                ).strftime("%Y-%m-%d")
+
+            except ValueError:
+                print("Could not derive return date.")
+
+    return constraints
 
 def _fallback_supervisor(query: str) -> dict:
     """Deterministic fallback that preserves the user's primary intent."""
@@ -600,6 +586,28 @@ IMPORTANT DATE EXTRACTION RULES:
   return date as 2026-10-17.
 - If an explicit return date is provided, use that date instead.
 
+DESTINATION AIRPORT RESOLUTION:
+
+Identify the destination's country and a suitable primary
+airport for the requested destination.
+
+For cities, select a major airport serving that city.
+For islands and regions, select the most relevant airport
+serving that destination.
+
+Examples:
+- Bali -> Indonesia, DPS
+- Phuket -> Thailand, HKT
+- Santorini -> Greece, JTR
+- Maldives -> Maldives, MLE
+
+Return:
+- destination_country: country name
+- destination_airport_iata: 3-letter IATA code
+
+Do not invent airport codes.
+If uncertain, return an empty destination_airport_iata.
+
 User request:
 {query}
 """
@@ -659,6 +667,7 @@ User request:
     else:
         trip_constraints = parsed.trip_constraints.model_dump()
         reasoning = parsed.reasoning
+    trip_constraints = normalize_trip_dates(trip_constraints)
 
     return {
         "selected_agents": selected,
@@ -685,6 +694,8 @@ async def flight_agent(state: TravelState):
     destination_input = constraints.get("destination", "").strip()
     departure_date = constraints.get("departure_date", "").strip()
     return_date = constraints.get("return_date", "").strip()
+    destination_country=constraints.get("destination_country", "").strip()
+    destination_airport_iata=constraints.get("destination_airport_iata", "").strip()
 
     print("\n========== FLIGHT AGENT INPUT ==========")
     print("Query:", query)
@@ -692,6 +703,7 @@ async def flight_agent(state: TravelState):
     print("Destination:", destination_input)
     print("Departure date:", departure_date)
     print("Return date:", return_date)
+    print("Destination country:", destination_country)
     print("========================================\n")
 
     # ------------------------------------------------------------
@@ -831,7 +843,8 @@ async def flight_agent(state: TravelState):
 
         destination_airports = resolve_airports(
             destination_input,
-            max_results=5,
+            destination_country=destination_country,
+            destination_airport_iata=destination_airport_iata,
         )
 
     except Exception as exc:
@@ -1254,36 +1267,199 @@ The response does not need to be JSON.
 # ============================================================
 # HOTEL AGENT
 # ============================================================
-@traceable(name="Hotel Agent", run_type="chain")
-async def hotel_agent(state: TravelState):
-    query = (
-        f"Find hotel/accommodation information relevant to this request. "
-        f"Do not plan flights, weather, activities, or a full itinerary. "
-        f"User request: {state['user_query']}"
+
+import json
+
+
+def extract_hotel_properties(data):
+    """Recursively locate the HasData properties list."""
+
+    if hasattr(data, "model_dump"):
+        data = data.model_dump()
+
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except json.JSONDecodeError:
+            return []
+
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and "text" in item:
+                found = extract_hotel_properties(item["text"])
+                if found:
+                    return found
+
+            found = extract_hotel_properties(item)
+            if found:
+                return found
+
+        return []
+
+    if not isinstance(data, dict):
+        return []
+
+    # Found the actual hotel properties.
+    properties = data.get("properties")
+    if isinstance(properties, list):
+        return properties
+
+    # Search common response wrapper keys.
+    for key in ("json", "data", "result", "content"):
+        if key in data:
+            found = extract_hotel_properties(data[key])
+            if found:
+                return found
+
+    return []
+
+
+def compact_hotel_results(properties, limit=5):
+    """Keep only useful hotel fields and rank by total price."""
+
+    hotels = []
+
+    for hotel in properties:
+        total_rate = hotel.get("totalRate") or {}
+        nightly_rate = hotel.get("ratePerNight") or {}
+
+        total_price = total_rate.get("extractedLowest")
+
+        # Ignore hotels without a usable price.
+        if total_price is None:
+            continue
+
+        hotels.append({
+            "name": hotel.get("name", "Unknown hotel"),
+            "description": (hotel.get("description") or "")[:200],
+            "rating": hotel.get("overallRating"),
+            "reviews": hotel.get("reviews"),
+            "hotel_class": hotel.get("hotelClass"),
+            "total_price": total_price,
+            "nightly_price": nightly_rate.get("extractedLowest"),
+            "amenities": (hotel.get("amenities") or [])[:5],
+            "link": hotel.get("link"),
+        })
+
+    # Remove duplicate hotel names.
+    unique_hotels = {}
+    for hotel in hotels:
+        unique_hotels.setdefault(hotel["name"], hotel)
+
+    # Cheapest first.
+    hotels = sorted(
+        unique_hotels.values(),
+        key=lambda h: h["total_price"]
     )
 
-    print("\n========== HOTEL AGENT INPUT ==========")
-    print(query)
-    print("=======================================\n")
+    return hotels[:limit]
+
+
+def format_hotel_markdown(hotels, check_in, check_out):
+    """Create concise human-readable hotel results."""
+
+    if not hotels:
+        return "No priced hotel options were found."
+
+    lines = [
+        f"## Hotel options ({check_in} to {check_out})",
+        f"Showing {len(hotels)} shortlisted hotels.",
+    ]
+
+    for index, hotel in enumerate(hotels, start=1):
+        lines.append(
+            f"""
+### {index}. {hotel['name']}
+- **Total stay:** ₹{hotel['total_price']:,}
+- **Per night:** ₹{hotel['nightly_price']:,}
+- **Rating:** {hotel['rating'] or 'Not available'}
+- **Reviews:** {hotel['reviews'] or 'Not available'}
+- **Category:** {hotel['hotel_class'] or 'Not available'}
+- **Amenities:** {', '.join(hotel['amenities']) or 'Not specified'}
+- **Description:** {hotel['description']}
+- **Website:** {hotel['link'] or 'Not available'}
+"""
+        )
+
+    return "\n".join(lines)
+
+@traceable(name="Hotel Agent", run_type="chain")
+async def hotel_agent(state: TravelState):
+
+    constraints = state.get("trip_constraints", {})
+
+    destination = constraints.get("destination", "")
+    check_in = constraints.get("departure_date", "")
+    check_out = constraints.get("return_date", "")
+
+    if not destination or not check_in or not check_out:
+        return {
+            "hotel_results": (
+                "Destination and check-in/check-out dates are required."
+            ),
+            "hotel_options": [],
+        }
 
     try:
-        result = await tavily_search(query)
-        result = _format_tavily_result(result)
+        result = await search_google_hotels(
+            destination=destination,
+            check_in=check_in,
+            check_out=check_out,
+            adults=1,
+            currency="INR",
+        )
+
+        # print("RESULT TYPE:", type(result))
+        # print("RESULT:", repr(result)[:2000])
+
+        # print("RESULT DATA TYPE:", type(result.data))
+        # print("RESULT DATA:", repr(result.data)[:3000])
+
+        if result.status != "ok":
+            raise RuntimeError(
+                result.error or "Google Hotels search failed"
+            )
+
+        # Extract raw HasData response.
+        properties = extract_hotel_properties(result.data)
+        print("EXTRACTED HOTEL COUNT:", len(properties))
+
+        if properties:
+            print("FIRST HOTEL:", properties[0].get("name"))
+            print("FIRST HOTEL PRICE:", properties[0].get("totalRate"))
+
+        # Filter and retain only five hotels.
+        hotel_options = compact_hotel_results(
+            properties,
+            limit=5,
+        )
+
+        # Convert to readable Markdown.
+        hotel_markdown = format_hotel_markdown(
+            hotel_options,
+            check_in,
+            check_out,
+        )
+
+        return {
+            "hotel_results": hotel_markdown,
+            "hotel_options": hotel_options,
+            "messages": [
+                AIMessage(content="Hotel search completed.")
+            ],
+        }
+
     except Exception as exc:
-        print(f"Hotel search failed: {type(exc).__name__}: {exc}")
-        result = "Hotel search data is currently unavailable."
+        print(f"Hotel search error: {exc}")
 
-    print("\n========== HOTEL SEARCH RESULT ==========")
-    print(result)
-    print("=========================================\n")
-
-    return {
-        "hotel_results": result,
-        "messages": [
-            AIMessage(content="Hotel agent completed.")
-        ],
-    }
-
+        return {
+            "hotel_results": "Hotel search is currently unavailable.",
+            "hotel_options": [],
+            "messages": [
+                AIMessage(content="Hotel search failed.")
+            ],
+        }
+    
 
 # ============================================================
 # WEATHER AGENT
@@ -1343,13 +1519,19 @@ def budget_agent(state: TravelState):
     print("\nFlight Results:")
     print(state.get("flight_results"))
 
-    print("\nHotel Results:")
-    print(state.get("hotel_results"))
+    # print("\nHotel Results:")
+    # print(state.get("hotel_results"))
 
     print("\nWeather Results:")
     print(state.get("weather_results"))
     print("=========================================\n")
 
+    hotel_options = state.get("hotel_options", [])
+
+    hotel_context = json.dumps(
+        hotel_options,
+        ensure_ascii=False,
+    )
     prompt = f"""
 Analyze whether this trip plan is realistic for the user's budget.
 
@@ -1363,7 +1545,7 @@ Flight results:
 {state.get('flight_results', '')}
 
 Hotel results:
-{state.get('hotel_results', '')}
+{hotel_context}
 
 Weather results:
 {state.get('weather_results', '')}
@@ -1409,15 +1591,17 @@ def itinerary_agent(state: TravelState):
     print("\nFlight Results:")
     print(state.get("flight_results"))
 
-    print("\nHotel Results:")
-    print(state.get("hotel_results"))
+    # print("\nHotel Results:")
+    # print(state.get("hotel_results"))
 
     print("\nWeather Results:")
     print(state.get("weather_results"))
 
     print("\nBudget Results:")
     print(state.get("budget_results"))
+    hotel_options = state.get("hotel_options", [])
 
+    selected_hotels = hotel_options[:3]
     print("===========================================\n")
 
     prompt = f"""
@@ -1437,7 +1621,7 @@ Flight results:
 {state.get('flight_results', '')}
 
 Hotel results:
-{state.get('hotel_results', '')}
+{selected_hotels}
 
 Weather results:
 {state.get('weather_results', '')}
